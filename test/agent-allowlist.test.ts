@@ -4,9 +4,16 @@ import { join, dirname } from "path";
 import { tmpdir } from "os";
 import {
   readAgentAllowlist,
+  readAllowlistFromFile,
   checkAllowlist,
+  checkAgainstAllowlist,
   buildDenialMessage,
+  buildCwdDenialMessage,
   resolveAgentName,
+  resolveAllowlistScope,
+  cwdConfigPath,
+  CWD_CONFIG_FILE,
+  type AllowlistScope,
 } from "../src/agent-allowlist.js";
 import { agentConfigPath } from "../src/agent-paths.js";
 
@@ -312,5 +319,220 @@ describe("agentConfigPath", () => {
         process.env["PGR_AGENT_CONFIG_FILE"] = original;
       }
     }
+  });
+});
+
+// ── working-directory allowlist (no AGENT_NAME) ──────────────────────────────
+//
+// Third tier: a solo user in one project directory, with no per-agent home
+// and no AGENT_NAME, gets a scoped read from a .pgr-agent.json sitting in the
+// directory they run pgr from. Tests resolve against a throwaway directory
+// passed explicitly — never the real process.cwd(), which this suite must not
+// depend on or write into.
+
+describe("working-directory allowlist", () => {
+  let projectDir: string;
+
+  beforeEach(() => {
+    projectDir = mkdtempSync(join(TEST_ROOT, "project-"));
+  });
+
+  afterEach(() => {
+    rmSync(projectDir, { recursive: true, force: true });
+  });
+
+  /** Narrow a scope to its allow list; operator mode has none. */
+  function allowFor(scope: AllowlistScope): string[] {
+    return scope.mode === "operator" ? [] : scope.allow;
+  }
+
+  function writeCwdConfig(config: unknown): void {
+    writeFileSync(
+      join(projectDir, CWD_CONFIG_FILE),
+      JSON.stringify(config, null, 2),
+      "utf-8"
+    );
+  }
+
+  // ── resolution tiers ──
+
+  it("resolves to cwd mode when a config file is present and no agent name", () => {
+    writeCwdConfig({ pgr: { tables: { allow: ["tickets"] } } });
+    const scope = resolveAllowlistScope(undefined, projectDir);
+    expect(scope.mode).toBe("cwd");
+    if (scope.mode === "cwd") {
+      expect(scope.allow).toEqual(["tickets"]);
+      expect(scope.configPath).toBe(join(projectDir, CWD_CONFIG_FILE));
+    }
+  });
+
+  it("resolves to operator mode when no config file and no agent name", () => {
+    const scope = resolveAllowlistScope(undefined, projectDir);
+    expect(scope.mode).toBe("operator");
+  });
+
+  it("resolves to agent mode when an agent name is set, ignoring a cwd file", () => {
+    writeConfig({ pgr: { tables: { allow: ["agent_table"] } } });
+    writeCwdConfig({ pgr: { tables: { allow: ["cwd_table"] } } });
+
+    const scope = resolveAllowlistScope(TEST_AGENT, projectDir);
+    expect(scope.mode).toBe("agent");
+    if (scope.mode === "agent") {
+      expect(scope.allow).toEqual(["agent_table"]);
+      expect(scope.configPath).toBe(testConfigPath());
+    }
+  });
+
+  it("agent mode wins even when the per-agent file is missing and a cwd file exists", () => {
+    // Default-deny under the agent's (absent) file, NOT a silent fall-through
+    // to the cwd file — precedence is by mode, not by which file happens to exist.
+    writeCwdConfig({ pgr: { tables: { allow: ["cwd_table"] } } });
+
+    const scope = resolveAllowlistScope(TEST_AGENT, projectDir);
+    expect(scope.mode).toBe("agent");
+    expect(scope.mode === "agent" && scope.allow).toEqual([]);
+    expect(
+      checkAgainstAllowlist(new Set(["cwd_table"]), allowFor(scope)).allowed
+    ).toBe(false);
+  });
+
+  // ── gating behaviour ──
+
+  it("allows a listed table", () => {
+    writeCwdConfig({ pgr: { tables: { allow: ["tickets", "comments"] } } });
+    const scope = resolveAllowlistScope(undefined, projectDir);
+    const allow = allowFor(scope);
+
+    expect(checkAgainstAllowlist(new Set(["tickets"]), allow).allowed).toBe(true);
+    expect(checkAgainstAllowlist(new Set(["comments"]), allow).allowed).toBe(true);
+  });
+
+  it("denies an unlisted table", () => {
+    writeCwdConfig({ pgr: { tables: { allow: ["tickets"] } } });
+    const scope = resolveAllowlistScope(undefined, projectDir);
+    const allow = allowFor(scope);
+
+    const result = checkAgainstAllowlist(new Set(["users"]), allow);
+    expect(result.allowed).toBe(false);
+    if (!result.allowed) {
+      expect(result.denied).toContain("users");
+    }
+  });
+
+  it("normalises and matches exactly as the per-agent tier does", () => {
+    writeCwdConfig({ pgr: { tables: { allow: ["Tickets"] } } });
+    const scope = resolveAllowlistScope(undefined, projectDir);
+    const allow = allowFor(scope);
+
+    expect(allow).toEqual(["tickets"]);
+    // Bare name in the list covers its schema-qualified form.
+    expect(checkAgainstAllowlist(new Set(["public.tickets"]), allow).allowed).toBe(true);
+  });
+
+  it("auto-allows information_schema and pg_catalog in cwd-gated mode", () => {
+    writeCwdConfig({ pgr: { tables: { allow: [] } } });
+    const scope = resolveAllowlistScope(undefined, projectDir);
+    const allow = allowFor(scope);
+
+    expect(
+      checkAgainstAllowlist(new Set(["information_schema.tables"]), allow).allowed
+    ).toBe(true);
+    expect(
+      checkAgainstAllowlist(new Set(["pg_catalog.pg_tables"]), allow).allowed
+    ).toBe(true);
+  });
+
+  // ── default-deny on a present but useless file ──
+
+  it("gates (default-deny) on an empty allow list", () => {
+    writeCwdConfig({ pgr: { tables: { allow: [] } } });
+    const scope = resolveAllowlistScope(undefined, projectDir);
+    expect(scope.mode).toBe("cwd");
+    expect(scope.mode === "cwd" && scope.allow).toEqual([]);
+    expect(
+      checkAgainstAllowlist(new Set(["tickets"]), allowFor(scope)).allowed
+    ).toBe(false);
+  });
+
+  it("gates (default-deny) on a file with no pgr block", () => {
+    writeCwdConfig({ somethingElse: true });
+    const scope = resolveAllowlistScope(undefined, projectDir);
+    expect(scope.mode).toBe("cwd");
+    expect(scope.mode === "cwd" && scope.allow).toEqual([]);
+  });
+
+  it("gates (default-deny) on malformed JSON", () => {
+    writeFileSync(join(projectDir, CWD_CONFIG_FILE), "{ not valid json", "utf-8");
+    const scope = resolveAllowlistScope(undefined, projectDir);
+    expect(scope.mode).toBe("cwd");
+    expect(scope.mode === "cwd" && scope.allow).toEqual([]);
+  });
+
+  it("gates (default-deny) on an empty file", () => {
+    writeFileSync(join(projectDir, CWD_CONFIG_FILE), "", "utf-8");
+    const scope = resolveAllowlistScope(undefined, projectDir);
+    expect(scope.mode).toBe("cwd");
+    expect(scope.mode === "cwd" && scope.allow).toEqual([]);
+  });
+
+  // ── path resolution ──
+
+  it("cwdConfigPath defaults to process.cwd()", () => {
+    // Read-only assertion: resolves the default, touches no file.
+    expect(cwdConfigPath()).toBe(join(process.cwd(), CWD_CONFIG_FILE));
+  });
+
+  it("PGR_AGENT_CONFIG_FILE does not move the cwd lookup", () => {
+    writeCwdConfig({ pgr: { tables: { allow: ["tickets"] } } });
+
+    const original = process.env["PGR_AGENT_CONFIG_FILE"];
+    process.env["PGR_AGENT_CONFIG_FILE"] = ".custom.json";
+    try {
+      const scope = resolveAllowlistScope(undefined, projectDir);
+      expect(scope.mode).toBe("cwd");
+      expect(scope.mode === "cwd" && scope.configPath).toBe(
+        join(projectDir, ".pgr-agent.json")
+      );
+      expect(scope.mode === "cwd" && scope.allow).toEqual(["tickets"]);
+    } finally {
+      if (original === undefined) {
+        delete process.env["PGR_AGENT_CONFIG_FILE"];
+      } else {
+        process.env["PGR_AGENT_CONFIG_FILE"] = original;
+      }
+    }
+  });
+
+  // ── shared parsing ──
+
+  it("readAllowlistFromFile parses the cwd file identically to a per-agent file", () => {
+    const config = { pgr: { tables: { allow: ["Tickets", 42, "comments"] } } };
+    writeCwdConfig(config);
+    writeConfig(config);
+
+    expect(readAllowlistFromFile(join(projectDir, CWD_CONFIG_FILE))).toEqual([
+      "tickets",
+      "comments",
+    ]);
+    expect(readAgentAllowlist(TEST_AGENT)).toEqual(["tickets", "comments"]);
+  });
+});
+
+// ── buildCwdDenialMessage ────────────────────────────────────────────────────
+
+describe("buildCwdDenialMessage", () => {
+  it("names the denied table and the file that gated it", () => {
+    const msg = buildCwdDenialMessage(["users"], "/some/project/.pgr-agent.json");
+    expect(msg).toContain("access denied");
+    expect(msg).toContain("`users`");
+    expect(msg).toContain("/some/project/.pgr-agent.json");
+    expect(msg).toContain("pgr.tables.allow");
+    expect(msg).toContain(`"allow": ["users"]`);
+  });
+
+  it("says how to get back to operator mode, and does not blame an agent config", () => {
+    const msg = buildCwdDenialMessage(["users"], "/some/project/.pgr-agent.json");
+    expect(msg).toContain("operator access");
+    expect(msg).not.toContain("agent allowlist");
   });
 });
