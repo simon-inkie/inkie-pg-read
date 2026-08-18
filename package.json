@@ -1,0 +1,24 @@
+{
+  "name": "inkie-pgr",
+  "version": "0.1.0",
+  "description": "Ad-hoc read-only Postgres query CLI for operators and agents, works with any Supabase-backed or plain Postgres database",
+  "license": "MIT",
+  "private": false,
+  "type": "module",
+  "bin": {
+    "pgr": "./dist/cli.js"
+  },
+  "scripts": {
+    "dev": "bun run src/cli.ts",
+    "build": "bun build src/cli.ts --outfile dist/cli.js --target node",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "postgres": "^3.4.5"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.4.0"
+  }
+}
