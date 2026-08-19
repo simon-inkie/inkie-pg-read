@@ -12,10 +12,17 @@ export type { QueryResult } from "./client.js";
 export { extractTableRefs } from "./table-refs.js";
 export {
   resolveAgentName,
+  resolveAllowlistScope,
   readAgentAllowlist,
+  readAllowlistFromFile,
+  cwdConfigPath,
+  CWD_CONFIG_FILE,
   checkAllowlist,
+  checkAgainstAllowlist,
   buildDenialMessage,
+  buildCwdDenialMessage,
   AllowlistDeniedError,
 } from "./agent-allowlist.js";
+export type { AllowlistScope } from "./agent-allowlist.js";
 export { writeAuditLog } from "./audit-log.js";
 export type { AuditEntry, AuditDecision } from "./audit-log.js";

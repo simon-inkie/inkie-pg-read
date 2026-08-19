@@ -20,9 +20,13 @@ import { assertSafeQuery, SqlGuardError } from "./sql-guard.js";
 import { extractTableRefs } from "./table-refs.js";
 import {
   resolveAgentName,
-  checkAllowlist,
+  resolveAllowlistScope,
+  checkAgainstAllowlist,
   buildDenialMessage,
+  buildCwdDenialMessage,
+  CWD_CONFIG_FILE,
   AllowlistDeniedError,
+  type AllowlistScope,
 } from "./agent-allowlist.js";
 import { writeAuditLog } from "./audit-log.js";
 import { runQuery } from "./client.js";
@@ -75,9 +79,18 @@ Per-agent table gating:
   When AGENT_NAME is set (or --agent is used), only tables listed in
   ${configPath} → pgr.tables.allow are accessible.
   (Override that location with PGR_AGENT_ROOT / PGR_AGENT_CONFIG_FILE.)
-  information_schema and pg_catalog are always allowed.
+
+  With no AGENT_NAME and no --agent, pgr looks for ${CWD_CONFIG_FILE} in the
+  directory you run it from. If that file is there, it gates the query the
+  same way: same file shape, same default-deny (a file with no
+  pgr.tables.allow list allows no tables). That location is fixed —
+  PGR_AGENT_ROOT / PGR_AGENT_CONFIG_FILE do not move it.
+
+  Both gated modes always allow information_schema and pg_catalog.
   To grant access, add the table to that file's pgr.tables.allow list.
-  With no AGENT_NAME and no --agent, the gate is bypassed (operator mode).
+
+  With no AGENT_NAME, no --agent and no ${CWD_CONFIG_FILE} in the current
+  directory, the gate is bypassed (operator mode).
 
 Examples:
   pgr "select id, created_at from audit_events order by created_at desc limit 20"
@@ -138,6 +151,25 @@ function parseArgs(argv: string[]): {
   return { query, format, outputFile, agentFlag, help, version };
 }
 
+/**
+ * What to record in the audit log's `agent` field.
+ *
+ * There is no agent name in the working-directory case, but "operator" would
+ * be wrong: that entry was gated, and the audit trail has to say so. A fixed
+ * "cwd-project" label reads distinctly from both an agent name and an
+ * ungated operator invocation.
+ */
+function auditAgentLabel(scope: AllowlistScope): string {
+  switch (scope.mode) {
+    case "agent":
+      return scope.agentName;
+    case "cwd":
+      return "cwd-project";
+    case "operator":
+      return "operator";
+  }
+}
+
 async function main(): Promise<void> {
   // Bun: process.argv = [bun, script, ...args]
   const args = process.argv.slice(2);
@@ -169,20 +201,25 @@ async function main(): Promise<void> {
     throw err;
   }
 
-  // Per-agent table-allowlist gate
+  // Table-allowlist gate: per-agent file, else a working-directory file, else
+  // operator mode (no gate). See resolveAllowlistScope.
   const agentName = resolveAgentName(agentFlag);
   const tableRefs = extractTableRefs(query);
+  const scope = resolveAllowlistScope(agentName);
 
-  if (agentName !== undefined) {
-    const result = checkAllowlist(tableRefs, agentName);
+  if (scope.mode !== "operator") {
+    const result = checkAgainstAllowlist(tableRefs, scope.allow);
     if (!result.allowed) {
-      const msg = buildDenialMessage(result.denied, agentName);
+      const msg =
+        scope.mode === "agent"
+          ? buildDenialMessage(result.denied, scope.agentName)
+          : buildCwdDenialMessage(result.denied, scope.configPath);
       process.stderr.write(msg + "\n");
 
       // Audit the denial (best-effort)
       writeAuditLog({
         ts: new Date().toISOString(),
-        agent: agentName,
+        agent: auditAgentLabel(scope),
         sql: query,
         tables_referenced: Array.from(tableRefs),
         decision: "deny",
@@ -196,7 +233,7 @@ async function main(): Promise<void> {
   // Audit the allowed invocation (best-effort, before query to capture intent)
   writeAuditLog({
     ts: new Date().toISOString(),
-    agent: agentName ?? "operator",
+    agent: auditAgentLabel(scope),
     sql: query,
     tables_referenced: Array.from(tableRefs),
     decision: "allow",

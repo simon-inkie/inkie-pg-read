@@ -134,7 +134,10 @@ one is overridable with an environment variable, read fresh on every invocation:
 | `PGR_PASS_ENTRY` | `pgr/readonly-connection-string` | `pass` entry holding the read-only connection string |
 
 So the per-agent creds file is `$PGR_AGENT_ROOT/$AGENT_NAME/.pgr-creds.age` and
-the table allowlist is `$PGR_AGENT_ROOT/$AGENT_NAME/$PGR_AGENT_CONFIG_FILE`.
+the table allowlist is `$PGR_AGENT_ROOT/$AGENT_NAME/$PGR_AGENT_CONFIG_FILE`. The
+working-directory allowlist described under [Per-agent table
+allowlist](#per-agent-table-allowlist) is deliberately outside all of this: it
+is always `./.pgr-agent.json`, whatever these variables are set to.
 
 If you already run a fleet of agents with its own conventions (agent homes
 somewhere other than `~/agents`, an existing per-agent config file you'd rather
@@ -176,10 +179,12 @@ Store the resulting connection string via whichever of Options 1-3 above fits yo
 
 ## Per-agent table allowlist
 
-Opt-in, and off unless you switch it on. `pgr` only gates table access when
-`AGENT_NAME` is set, as an environment variable or per-invocation via
-`--agent=<name>`. With neither set you're in operator mode: no gate, every table
-the role can read is queryable, and the rest of this section doesn't apply to you.
+Opt-in, and off unless you switch it on. `pgr` gates table access in two
+situations: when `AGENT_NAME` is set, as an environment variable or
+per-invocation via `--agent=<name>`, and when a `.pgr-agent.json` sits in the
+directory you run `pgr` from. With neither, you're in operator mode: no gate,
+every table the role can read is queryable, and the rest of this section doesn't
+apply to you.
 
 When a name *is* set, `pgr` reads `~/agents/$AGENT_NAME/.pgr-agent.json` and
 allows only the tables listed under `pgr.tables.allow`. It is default-deny: a
@@ -208,10 +213,30 @@ case-insensitively, and a bare name in the list also allows its schema-qualified
 form (`your_table_here` covers `public.your_table_here`). Other keys in the file
 are left alone, `pgr` only reads its own block.
 
+### Without an agent name, per directory
+
+If `AGENT_NAME` isn't set, `pgr` looks for `.pgr-agent.json` in the directory you
+ran it from. If that file is there, it gates the invocation on exactly the same
+terms: same file shape, same `pgr.tables.allow` list, same default-deny, and
+`information_schema` and `pg_catalog` are still readable. This is the scoped
+read for one person in one project, with no agent homes to set up and no
+`AGENT_NAME` to export. Drop the file in the project to scope `pgr` there,
+delete it to go back to operator mode.
+
+That location is fixed on purpose. `PGR_AGENT_ROOT` and `PGR_AGENT_CONFIG_FILE`
+move the per-agent file, not this one, so what gates a given directory is
+answerable by looking in it.
+
+The per-agent tier wins outright. With `AGENT_NAME` set, `pgr` reads that
+agent's file and ignores any `.pgr-agent.json` in the working directory,
+including when the agent's own file is missing, which stays default-deny as
+before. Nothing about an existing `AGENT_NAME` setup changes.
+
 Gotcha: the trigger is the mere presence of `AGENT_NAME`. If your shell exports
 it for something unrelated, this gate switches on silently and starts denying
 queries. If `pgr` refuses a table you know your role can read, check
-`echo $AGENT_NAME` first.
+`echo $AGENT_NAME` first, then check for a `.pgr-agent.json` in the directory
+you're standing in.
 
 ## SQL guard
 
@@ -247,9 +272,10 @@ The guard biases toward false-positives, if a query pattern is borderline, it's 
 - Never expose `pgr` to untrusted input via HTTP or any network interface.
 - Connection strings are never logged or printed.
 - Queries themselves *are* logged. Every invocation appends one JSON line to
-  `~/.pgr/audit/YYYY-MM-DD.jsonl`: timestamp, the agent name (or `operator`), the
-  full SQL text, the tables it referenced, and the allow/deny decision (plus the
-  reason, on a deny). It's local-only, never transmitted anywhere, and
+  `~/.pgr/audit/YYYY-MM-DD.jsonl`: timestamp, the agent name (or `cwd-project`
+  when a working-directory allowlist gated it, or `operator` when nothing gated
+  it), the full SQL text, the tables it referenced, and the allow/deny decision
+  (plus the reason, on a deny). It's local-only, never transmitted anywhere, and
   best-effort, a failed write goes to stderr and the query still runs, so treat it
   as a record for you rather than a tamper-proof audit trail. Delete or rotate the
   directory yourself; `pgr` never prunes it.
