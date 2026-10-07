@@ -187,7 +187,8 @@ every table the role can read is queryable, and the rest of this section doesn't
 apply to you.
 
 When a name *is* set, `pgr` reads `~/agents/$AGENT_NAME/.pgr-agent.json` and
-allows only the tables listed under `pgr.tables.allow`. It is default-deny: a
+allows only the tables listed under `pgr.tables.allow` (optionally limited to
+some columns, see [Column permissions](#column-permissions)). It is default-deny: a
 missing file, a missing `pgr` block, or an empty list means no tables. Denied
 queries exit 1 without opening a connection. `information_schema` and
 `pg_catalog` are always readable, so an agent can still introspect the schema.
@@ -237,6 +238,84 @@ it for something unrelated, this gate switches on silently and starts denying
 queries. If `pgr` refuses a table you know your role can read, check
 `echo $AGENT_NAME` first, then check for a `.pgr-agent.json` in the directory
 you're standing in.
+
+### Column permissions
+
+An entry in `allow` can be an object that limits a table to some of its columns,
+alongside plain strings:
+
+```json
+{
+  "pgr": {
+    "tables": {
+      "allow": [
+        "interviews",
+        { "table": "memberships", "columns": ["id", "created_at", "role", "client_id"] }
+      ]
+    }
+  }
+}
+```
+
+A plain string keeps its meaning: every column of that table. An object entry is
+default-deny for columns: any column not in `columns` is refused. This works in
+both the per-agent file and the working-directory file, and the `table` name
+follows the same matching rules as a string entry (case-insensitive, a bare name
+also covers its schema-qualified form).
+
+For a table with a column list, `pgr` parses the query before it runs and refuses
+it, without opening a connection, if it could read anything else. It resolves
+columns through aliases, joins, CTEs, subqueries, `LATERAL` and set operations.
+The query is refused if it:
+
+- references a column that is not listed, anywhere in the query (`select`,
+  `where`, `join ... on`, `using`, `group by`, `order by`, window clauses),
+- uses `select *`, `m.*`, or any other whole-row form (`to_jsonb(m)`,
+  `row_to_json(m)`, a bare alias, `m::text`),
+- uses an unqualified column while a restricted table is in scope, since `pgr`
+  has no catalog to tell which table it belongs to (write `m.role`, not `role`),
+- renames columns with an alias list (`from memberships as m(a, b)`),
+- calls a function that runs SQL from a string (`query_to_xml` and friends), including as a `FROM` item,
+- reads `pg_stats`, `pg_stats_ext`, `pg_stats_ext_exprs`, `pg_statistic` or
+  `pg_statistic_ext_data`, which expose sample values and histogram bounds of
+  every column (the rest of `pg_catalog` stays readable), or
+- is a query `pgr` cannot parse. While column rules are active this is refused
+  outright, whether or not it names a restricted table, because there is no way
+  to tell what it reads. If a legitimate query is refused for this reason, write
+  it in a simpler form (`NATURAL JOIN`, `(t).col`, `TABLE t` and `COLLATE` are
+  not understood by the parser).
+
+`count(*)` and `exists (select * ...)` are fine, as they read no column. A bare
+name in `order by` that matches an output column is fine too.
+
+The denial names the column and the config file:
+
+```
+pgr: access denied for column `memberships.email`.
+Reason: memberships has a column allowlist and `email` is not on it (~/agents/me/.pgr-agent.json -> pgr.tables.allow).
+Allowed columns: id, created_at, role, client_id.
+```
+
+The config is validated strictly. A file that is not valid JSON, an unknown key
+under `pgr` or `pgr.tables`, an object entry with extra keys, a missing or empty
+`columns`, a wildcard column, or the same table listed twice makes `pgr` exit with
+an error naming the file and the offending path. It never falls back to a guess.
+A missing file, or a file with no `pgr.tables.allow`, is still plain default-deny.
+This is stricter than before: junk entries in `allow` (a number, `null`) and
+malformed JSON used to be skipped silently and now stop `pgr` with an error.
+
+Identifiers follow Postgres folding: unquoted names are case-insensitive, but a
+quoted name keeps its case, so `m."ROLE"` is not the allowed column `role`.
+Column names in `columns` are matched in lower case, so a column whose real name
+has capital letters cannot be allowed this way (it fails closed); use a view with
+lower-case names instead.
+
+Known limitations: the list of functions that run SQL from a string is a
+denylist, so something it does not name (`dblink`, a `SECURITY DEFINER` helper in
+your database, a function added by a future Postgres version) can still read
+columns this check cannot see. Like the rest of the SQL guard this is a local,
+defence-in-depth check, not the security boundary. For hard column limits that hold for every caller, grant the
+database role only those columns. Row-level filtering is not part of this.
 
 ## SQL guard
 
