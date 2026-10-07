@@ -133,11 +133,14 @@ describe("cli gate: working-directory config", () => {
     expect(wasDenied(result)).toBe(true);
   });
 
-  it("denies everything when the file is malformed (default-deny)", () => {
+  it("fails loudly, without connecting, when the file is malformed", () => {
     const result = run("select * from tickets limit 1", {
       cwdConfig: "{ not valid json",
     });
-    expect(wasDenied(result)).toBe(true);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("invalid allowlist config");
+    expect(result.stderr).toContain(".pgr-agent.json");
+    expect(result.stderr).not.toContain("Query error");
   });
 
   it("still allows information_schema with an empty allow list", () => {
@@ -176,5 +179,90 @@ describe("cli gate: precedence", () => {
     });
     expect(wasDenied(result)).toBe(true);
     expect(result.stderr).toContain("agent allowlist");
+  });
+});
+
+describe("cli gate: column permissions", () => {
+  const config = {
+    pgr: {
+      tables: {
+        allow: [
+          "interviews",
+          { table: "memberships", columns: ["id", "created_at", "role", "client_id"] },
+        ],
+      },
+    },
+  };
+
+  /** Denied by the column gate: no connection, message names column and file. */
+  function wasColumnDenied(result: RunResult): boolean {
+    return (
+      result.exitCode === 1 &&
+      result.stderr.includes("access denied") &&
+      !result.stderr.includes("Query error")
+    );
+  }
+
+  it("lets permitted columns through to the connection", () => {
+    const result = run("select m.id, m.role from memberships m limit 1", {
+      cwdConfig: config,
+    });
+    expect(wasDenied(result)).toBe(false);
+    expect(result.stderr).toContain("Query error");
+  });
+
+  it("keeps plain-string tables unrestricted alongside object entries", () => {
+    const result = run("select * from interviews limit 1", { cwdConfig: config });
+    expect(wasDenied(result)).toBe(false);
+  });
+
+  it("denies an unpermitted column, naming the column and the config file", () => {
+    const result = run("select m.email from memberships m", { cwdConfig: config });
+    expect(wasColumnDenied(result)).toBe(true);
+    expect(result.stderr).toContain("memberships.email");
+    expect(result.stderr).toContain(".pgr-agent.json");
+    expect(result.stderr).toContain("Allowed columns: id, created_at, role, client_id");
+  });
+
+  it("denies select * on a restricted table", () => {
+    const result = run("select * from memberships", { cwdConfig: config });
+    expect(wasColumnDenied(result)).toBe(true);
+    expect(result.stderr).toContain("select *");
+  });
+
+  it("denies a whole-row function over a restricted table", () => {
+    const result = run("select to_jsonb(m) from memberships m", { cwdConfig: config });
+    expect(wasColumnDenied(result)).toBe(true);
+    expect(result.stderr).toContain("whole-row");
+  });
+
+  it("applies in the per-agent tier too", () => {
+    const result = run("select m.email from memberships m", {
+      agentName: "col-agent",
+      agentConfig: config,
+    });
+    expect(wasColumnDenied(result)).toBe(true);
+    expect(result.stderr).toContain("memberships.email");
+  });
+
+  it("still applies the table gate first", () => {
+    const result = run("select 1 from secrets", { cwdConfig: config });
+    expect(wasDenied(result)).toBe(true);
+    expect(result.stderr).toContain("table `secrets`");
+  });
+
+  it("fails loudly on a malformed object entry, without connecting", () => {
+    const result = run("select 1 from interviews", {
+      cwdConfig: { pgr: { tables: { allow: [{ table: "memberships" }] } } },
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("invalid allowlist config");
+    expect(result.stderr).toContain("allow[0].columns");
+    expect(result.stderr).not.toContain("Query error");
+  });
+
+  it("does not gate columns in operator mode", () => {
+    const result = run("select * from memberships");
+    expect(wasDenied(result)).toBe(false);
   });
 });

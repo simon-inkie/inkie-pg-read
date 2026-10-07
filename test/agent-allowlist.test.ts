@@ -9,10 +9,12 @@ import {
   checkAgainstAllowlist,
   buildDenialMessage,
   buildCwdDenialMessage,
+  buildColumnDenialMessage,
   resolveAgentName,
   resolveAllowlistScope,
   cwdConfigPath,
   CWD_CONFIG_FILE,
+  AllowlistConfigError,
   type AllowlistScope,
 } from "../src/agent-allowlist.js";
 import { agentConfigPath } from "../src/agent-paths.js";
@@ -157,9 +159,9 @@ describe("readAgentAllowlist", () => {
     ]);
   });
 
-  it("ignores non-string entries in allow array", () => {
-    writeConfig({ pgr: { tables: { allow: ["tickets", 42, null, true] } } });
-    expect(readAgentAllowlist(TEST_AGENT)).toEqual(["tickets"]);
+  it("throws on non-string, non-object entries in allow array", () => {
+    writeConfig({ pgr: { tables: { allow: ["tickets", 42] } } });
+    expect(() => readAgentAllowlist(TEST_AGENT)).toThrow(AllowlistConfigError);
   });
 
   it("works alongside other config keys (fileZones etc)", () => {
@@ -170,11 +172,12 @@ describe("readAgentAllowlist", () => {
     expect(readAgentAllowlist(TEST_AGENT)).toEqual(["ticket_transcripts"]);
   });
 
-  it("returns empty array on malformed JSON", () => {
+  it("throws on malformed JSON, naming the file", () => {
     const configPath = testConfigPath();
     mkdirSync(dirname(configPath), { recursive: true });
     writeFileSync(configPath, "{ not valid json", "utf-8");
-    expect(readAgentAllowlist(TEST_AGENT)).toEqual([]);
+    expect(() => readAgentAllowlist(TEST_AGENT)).toThrow(AllowlistConfigError);
+    expect(() => readAgentAllowlist(TEST_AGENT)).toThrow(".pgr-agent.json");
   });
 });
 
@@ -461,18 +464,18 @@ describe("working-directory allowlist", () => {
     expect(scope.mode === "cwd" && scope.allow).toEqual([]);
   });
 
-  it("gates (default-deny) on malformed JSON", () => {
+  it("fails loudly on malformed JSON", () => {
     writeFileSync(join(projectDir, CWD_CONFIG_FILE), "{ not valid json", "utf-8");
-    const scope = resolveAllowlistScope(undefined, projectDir);
-    expect(scope.mode).toBe("cwd");
-    expect(scope.mode === "cwd" && scope.allow).toEqual([]);
+    expect(() => resolveAllowlistScope(undefined, projectDir)).toThrow(
+      AllowlistConfigError
+    );
   });
 
-  it("gates (default-deny) on an empty file", () => {
+  it("fails loudly on an empty file", () => {
     writeFileSync(join(projectDir, CWD_CONFIG_FILE), "", "utf-8");
-    const scope = resolveAllowlistScope(undefined, projectDir);
-    expect(scope.mode).toBe("cwd");
-    expect(scope.mode === "cwd" && scope.allow).toEqual([]);
+    expect(() => resolveAllowlistScope(undefined, projectDir)).toThrow(
+      AllowlistConfigError
+    );
   });
 
   // ── path resolution ──
@@ -506,7 +509,7 @@ describe("working-directory allowlist", () => {
   // ── shared parsing ──
 
   it("readAllowlistFromFile parses the cwd file identically to a per-agent file", () => {
-    const config = { pgr: { tables: { allow: ["Tickets", 42, "comments"] } } };
+    const config = { pgr: { tables: { allow: ["Tickets", "comments"] } } };
     writeCwdConfig(config);
     writeConfig(config);
 
@@ -534,5 +537,82 @@ describe("buildCwdDenialMessage", () => {
     const msg = buildCwdDenialMessage(["users"], "/some/project/.pgr-agent.json");
     expect(msg).toContain("operator access");
     expect(msg).not.toContain("agent allowlist");
+  });
+});
+
+// ── column rules in scope resolution and denial message ──────────────────────
+
+describe("column rules", () => {
+  it("resolveAllowlistScope exposes column rules next to the table list", () => {
+    writeConfig({
+      pgr: {
+        tables: {
+          allow: ["interviews", { table: "Memberships", columns: ["id", "Role"] }],
+        },
+      },
+    });
+    const scope = resolveAllowlistScope(TEST_AGENT);
+    expect(scope.mode === "agent" && scope.allow).toEqual(["interviews", "memberships"]);
+    expect(scope.mode === "agent" && scope.columnRules.get("memberships")).toEqual([
+      "id",
+      "role",
+    ]);
+  });
+
+  it("string-only configs have no column rules", () => {
+    writeConfig({ pgr: { tables: { allow: ["interviews"] } } });
+    const scope = resolveAllowlistScope(TEST_AGENT);
+    expect(scope.mode === "agent" && scope.columnRules.size).toBe(0);
+  });
+
+  it("an object entry still allows its table through the table gate", () => {
+    writeConfig({
+      pgr: { tables: { allow: [{ table: "memberships", columns: ["id"] }] } },
+    });
+    expect(checkAllowlist(new Set(["memberships"]), TEST_AGENT).allowed).toBe(true);
+    expect(checkAllowlist(new Set(["public.memberships"]), TEST_AGENT).allowed).toBe(true);
+    expect(checkAllowlist(new Set(["other"]), TEST_AGENT).allowed).toBe(false);
+  });
+});
+
+describe("buildColumnDenialMessage", () => {
+  const path = "/x/.pgr-agent.json";
+
+  it("names the column, the table, the allowed columns and the config file", () => {
+    const msg = buildColumnDenialMessage(
+      [{ kind: "column", table: "memberships", column: "email", allowed: ["id", "role"] }],
+      path
+    );
+    expect(msg).toContain("`memberships.email`");
+    expect(msg).toContain("Allowed columns: id, role");
+    expect(msg).toContain(".pgr-agent.json");
+    expect(msg).toContain('{ "table": "memberships", "columns": ["id","role","email"] }');
+  });
+
+  it("explains select * and qualification fixes", () => {
+    const star = buildColumnDenialMessage(
+      [{ kind: "star", table: "memberships", allowed: ["id"] }],
+      path
+    );
+    expect(star).toContain("select *");
+    expect(star).toContain("Name the columns");
+
+    const bare = buildColumnDenialMessage(
+      [{ kind: "unqualified", table: "memberships", column: "id", allowed: ["id"] }],
+      path
+    );
+    expect(bare).toContain("Qualify");
+  });
+
+  it("lists further violations on one line", () => {
+    const msg = buildColumnDenialMessage(
+      [
+        { kind: "column", table: "t", column: "a", allowed: ["id"] },
+        { kind: "column", table: "t", column: "b", allowed: ["id"] },
+        { kind: "star", table: "t", allowed: ["id"] },
+      ],
+      path
+    );
+    expect(msg).toContain("Also denied: column `t.b`; `*` over `t`.");
   });
 });

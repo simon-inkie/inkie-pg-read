@@ -50,11 +50,63 @@ Out:
 
 ## Decisions log
 
-(Filled in as the work lands.)
+1. **Real SQL parser, `pgsql-ast-parser`, as the one new dependency.** Column resolution across
+   aliases, joins, CTEs and subqueries is not reliable with the existing regex extraction. The parser
+   is pure TypeScript (no native build, works under Bun), and the only added runtime dependency
+   besides its own small tree. The guard fails closed on parse failure, so its syntax gaps cost
+   usability, never safety.
+2. **Fail closed on unparseable SQL, but only if it mentions a restricted table.** A query the parser
+   cannot read (`NATURAL JOIN`, `(t).col`, `TABLE t`, `COLLATE`) is refused when any restricted table
+   name appears as an identifier in it, and let through otherwise, so unrelated queries are unaffected.
+3. **Conservative resolution, matching the issue's suggested first version.** Unqualified columns are
+   refused whenever a restricted source is in scope (including outer scopes of a correlated
+   subquery), because there is no catalog to say which table owns the name. `select *` and `t.*`
+   over a restricted source are refused. Every column reference anywhere in the query counts, so
+   `where m.email = 'x'` is refused too (it would be a membership oracle).
+4. **Derived tables and CTEs are opaque.** Their bodies are checked on their own, so whatever they
+   expose is already limited. A CTE does not shadow a real table of the same name inside its own
+   body (non-recursive), and a schema-qualified name never resolves to a CTE.
+5. **Whole-row detection falls out of the unqualified rule.** A bare alias (`to_jsonb(m)`, `m::text`)
+   is an unqualified reference whose name is a restricted source, reported as `whole-row` for a
+   clearer message. `m.*` inside a function is a `star`.
+6. **Allowed exceptions: `count(*)`, `exists (select * ...)`, ORDER BY output names.** None reads a
+   column. A bare ORDER BY name is only waved through when it matches an output column of that
+   select (Postgres resolves it there first).
+7. **Alias column lists on a restricted table are refused** (`from t as m(a, b)`), since renaming
+   columns would defeat name matching.
+8. **Dynamic-SQL functions are refused while column rules are active** (`query_to_xml`,
+   `table_to_xml`, `cursor_to_xml`, `schema_to_xml`, `database_to_xml` families, `ts_stat`). They run
+   SQL from a string, which no static check can see.
+9. **Rule matching over-restricts rather than guess a search path.** A rule for `memberships` applies
+   to `memberships` and to any `schema.memberships`; a rule for `public.memberships` applies to the
+   bare name too. If several rules apply, a column must satisfy all of them.
+10. **Strict config validation, and a behaviour change for malformed files.** Previously a malformed
+    file or non-string entry was silently ignored (default-deny). Now it throws
+    `AllowlistConfigError` naming the file and path, and the CLI exits 1 before connecting. Rejected:
+    non-JSON, non-object top level, wrong types, unknown keys under `pgr`, `pgr.tables` and in
+    object entries, empty strings, an object without `columns`, an empty `columns` list, a `*`
+    column, and duplicate tables in any form. Missing `pgr`, `tables` or `allow` stays quiet
+    default-deny, because a shared config file may not configure pgr at all. Existing tests that
+    asserted the old silent behaviour were updated.
+11. **Empty `columns` is an error, not "no columns".** It is more likely a mistake than intent, and
+    the plain string form already covers "all columns".
+12. **API shape kept.** `readAllowlistFromFile` still returns table names; column rules come from the
+    new `readAllowConfigFromFile` and `scope.columnRules`. `checkAgainstAllowlist` is unchanged.
+13. **Order of gates.** Table gate first, then column gate, then audit and connect. Column denials
+    are written to the audit log with `decision: deny`.
 
 ## Follow-ups
 
-(Filled in as the work lands.)
+- The existing table gate misses tables after a comma in FROM: `extractTableRefs("select 1 from
+  interviews, secret_table")` returns only `interviews`. Reproduced; not touched here. The column guard
+  does see such tables (it uses the parser), so restricted tables are still covered. Worth feeding the
+  parser's table list into the table gate.
+- The same extraction can miss tables in other shapes the regex does not model; the parser walk could
+  replace it.
+- Column rules for views, and per-column rules for `information_schema` / `pg_catalog`, are not
+  supported.
+- Users may want an opt-in way to relax the unqualified-column rule when only one table is in scope.
+  Without a catalog that cannot be proven safe, so it is left out.
 
 ## Review feedback
 

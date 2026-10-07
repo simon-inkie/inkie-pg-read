@@ -187,3 +187,18 @@ const SQL_KEYWORDS = new Set([
   "with", "recursive", "lateral", "exists", "between", "like", "ilike",
   "table", "view", "index", "schema", "database", "if",
 ]);
+
+/**
+ * Every identifier-shaped token in a query, lower-cased, with comments and
+ * string literals removed and double quotes stripped. Used as a coarse,
+ * over-inclusive "does this query mention name X anywhere" check when the
+ * query cannot be parsed properly (see column-guard.ts).
+ */
+export function identifierTokens(sql: string): Set<string> {
+  const cleaned = stripStringLiterals(stripComments(sql));
+  const tokens = new Set<string>();
+  for (const m of cleaned.matchAll(/"([^"]+)"|([A-Za-z_][A-Za-z0-9_$]*)/g)) {
+    tokens.add((m[1] ?? m[2]!).toLowerCase());
+  }
+  return tokens;
+}
