@@ -100,18 +100,23 @@ Out:
     ones; aliases, qualifiers, columns, CTE names and `USING` names are compared as given. Only
     table and schema names (matched against config) and function names (deny list) are lower-cased,
     which can only over-match. Folding everything would let `"M"` stand in for `m`.
-15. **Order of gates.** Table gate first, then column gate, then audit and connect. Column denials
+15. **Table gate now sees comma-separated FROM items.** The existing regex extraction missed
+    `from a, b`. `extractTableRefs` now also adds every FROM table the AST finds (subqueries, CTE
+    bodies, joins), excluding CTE names in scope. It only adds references, so a parser gap cannot
+    loosen the gate. Small change, so done here rather than left as a follow-up; it applies to the
+    table gate generally, not only to column rules.
+16. **Functions in FROM go through the same call check.** A FROM item that is a function call is
+    visited as a call node, so the dynamic-SQL deny list applies in every position.
+17. **Column names in rules are matched in lower case.** Query identifiers keep their case, so a rule
+    column with capitals can never match a quoted `"Role"`. That fails closed; documented in the
+    README.
+18. **Order of gates.** Table gate first, then column gate, then audit and connect. Column denials
     are written to the audit log with `decision: deny`.
 
 ## Follow-ups
 
-- The existing table gate misses tables after a comma in FROM: `extractTableRefs("select 1 from
-  interviews, secret_table")` returns only `interviews`. Reproduced; not touched here. The column guard
-  does see such tables (it uses the parser), so restricted tables are still covered. Worth feeding the
-  parser's table list into the table gate.
-- Suggest filing the comma-FROM gap as its own issue; this PR's parser walk could feed the table gate.
-- The same extraction can miss tables in other shapes the regex does not model; the parser walk could
-  replace it.
+- `extractTableRefs` still starts from regexes and only adds what the AST sees. Making the AST the
+  sole source (and dropping the regexes) would be a cleaner follow-up.
 - Column rules for views, and per-column rules for `information_schema` / `pg_catalog`, are not
   supported.
 - Users may want an opt-in way to relax the unqualified-column rule when only one table is in scope.
@@ -143,3 +148,17 @@ Opus review of the first push: changes needed.
    Follow-ups with a suggestion to file it as its own issue.
 6. **Note junk-entry behaviour change.** Response: added to the README strict-validation paragraph and
    the PR description.
+
+Second Opus review (head f240f21): changes needed; earlier findings hold.
+
+7. **Blocker: dynamic-SQL functions as FROM items were never checked.** Confirmed from the code:
+   pass 2 of `select()` visited only a FROM call's args, so the deny list never ran, and the comma-FROM
+   gap hid the call from the table gate. Response: a FROM call is now visited as a call node. Tests:
+   comma, `lateral`, `cross join`, `join ... on`, `left join lateral`, bare FROM, schema-qualified,
+   `table_to_xml`, `ts_stat` (which this also fixes), plus ordinary `generate_series` and `jsonb_each`
+   still allowed, and a CLI test.
+8. **Also fix the comma-FROM gap in the table gate.** Response: done, it was a small change (decision
+   15). Tests in `table-refs.test.ts` and the CLI. Dropped from Follow-ups.
+9. **Nit: orphaned JSDoc for `DYNAMIC_SQL_FUNCTIONS`.** Response: moved onto the constant.
+10. **Nit: `ts_stat` only enforced in the select list.** Response: fixed by point 7.
+11. **Nit: mixed-case rule columns can never match.** Response: documented (decision 17).

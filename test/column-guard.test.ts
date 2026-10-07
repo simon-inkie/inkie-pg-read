@@ -386,6 +386,34 @@ describe("column guard: queries the parser cannot read", () => {
   });
 });
 
+describe("column guard: dynamic SQL functions as FROM items", () => {
+  const Q = "query_to_xml('select email from memberships', true, false, '')";
+
+  it("refuses them after a comma, lateral, cross join and join", () => {
+    for (const from of [
+      `other o, ${Q} x`,
+      `other o, lateral ${Q} x`,
+      `other o cross join ${Q} x`,
+      `other o join ${Q} x on true`,
+      `other o left join lateral ${Q} x on true`,
+      `${Q} x`,
+    ]) {
+      deniedAs(`select 1 from ${from}`, "function", "query_to_xml");
+    }
+  });
+
+  it("refuses schema-qualified and other family members", () => {
+    deniedAs(`select 1 from other o, pg_catalog.${Q} x`, "function");
+    deniedAs("select x from other o, table_to_xml('memberships', true, false, '') x", "function", "table_to_xml");
+    deniedAs("select * from ts_stat('select email from memberships')", "function", "ts_stat");
+  });
+
+  it("still allows ordinary set-returning functions in FROM", () => {
+    ok("select g from other o, generate_series(1, 3) g");
+    ok("select e.key from other o, jsonb_each(o.data) e");
+  });
+});
+
 describe("column guard: statistics relations", () => {
   it("refuses pg_stats and friends in any position or schema form", () => {
     for (const rel of ["pg_stats", "pg_catalog.pg_stats", "pg_stats_ext", "pg_stats_ext_exprs", "pg_statistic"]) {

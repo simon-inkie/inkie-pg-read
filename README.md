@@ -275,7 +275,7 @@ The query is refused if it:
 - uses an unqualified column while a restricted table is in scope, since `pgr`
   has no catalog to tell which table it belongs to (write `m.role`, not `role`),
 - renames columns with an alias list (`from memberships as m(a, b)`),
-- calls a function that runs SQL from a string (`query_to_xml` and friends),
+- calls a function that runs SQL from a string (`query_to_xml` and friends), including as a `FROM` item,
 - reads `pg_stats`, `pg_stats_ext`, `pg_stats_ext_exprs`, `pg_statistic` or
   `pg_statistic_ext_data`, which expose sample values and histogram bounds of
   every column (the rest of `pg_catalog` stays readable), or
@@ -306,6 +306,9 @@ malformed JSON used to be skipped silently and now stop `pgr` with an error.
 
 Identifiers follow Postgres folding: unquoted names are case-insensitive, but a
 quoted name keeps its case, so `m."ROLE"` is not the allowed column `role`.
+Column names in `columns` are matched in lower case, so a column whose real name
+has capital letters cannot be allowed this way (it fails closed); use a view with
+lower-case names instead.
 
 Known limitations: the list of functions that run SQL from a string is a
 denylist, so something it does not name (`dblink`, a `SECURITY DEFINER` helper in

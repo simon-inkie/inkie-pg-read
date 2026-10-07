@@ -63,11 +63,6 @@ export type ColumnCheckResult =
   | { allowed: false; violations: ColumnViolation[] };
 
 /**
- * Functions that execute SQL passed as text (or read whole tables by name).
- * They would sidestep both gates, so they are refused whenever column rules
- * are active.
- */
-/**
  * System relations that expose column values (most common values, histogram
  * bounds). pg_catalog is otherwise always readable, so these are refused
  * whenever column rules are active, in any schema position.
@@ -80,6 +75,12 @@ const STATS_RELATIONS = new Set([
   "pg_statistic_ext_data",
 ]);
 
+/**
+ * Functions that execute SQL passed as text (or read whole tables by name).
+ * They would sidestep both gates, so they are refused whenever column rules
+ * are active, in a select list, a WHERE clause or a FROM item alike. This is a
+ * denylist, so it cannot be complete (see the README).
+ */
 const DYNAMIC_SQL_FUNCTIONS = new Set([
   "query_to_xml",
   "query_to_xml_and_xmlschema",
@@ -306,7 +307,10 @@ class Checker {
         this.joinUsing(join, scope);
       }
       if (f["type"] === "statement") this.visit(f["statement"], scope);
-      if (f["type"] === "call") this.visit(f["args"], scope);
+      // A function in FROM is checked like any other call (deny list, args).
+      if (f["type"] === "call") {
+        this.visit({ type: "call", function: f["function"], args: f["args"] }, scope);
+      }
     }
 
     const outputNames = new Set<string>();

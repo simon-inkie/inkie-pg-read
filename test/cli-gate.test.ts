@@ -261,6 +261,21 @@ describe("cli gate: column permissions", () => {
     expect(result.stderr).not.toContain("Query error");
   });
 
+  it("denies a table that follows a comma in FROM", () => {
+    const result = run("select 1 from interviews, secrets", { cwdConfig: config });
+    expect(wasDenied(result)).toBe(true);
+    expect(result.stderr).toContain("table `secrets`");
+  });
+
+  it("denies a dynamic-SQL function used as a FROM item", () => {
+    const result = run(
+      "select 1 from interviews o, query_to_xml('select email from memberships', true, false, '') x",
+      { cwdConfig: config }
+    );
+    expect(wasColumnDenied(result)).toBe(true);
+    expect(result.stderr).toContain("query_to_xml");
+  });
+
   it("denies pg_stats while column rules are active", () => {
     const result = run(
       "select most_common_vals from pg_catalog.pg_stats where attname = 'email'",
