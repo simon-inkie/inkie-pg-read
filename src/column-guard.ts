@@ -97,6 +97,7 @@ const DYNAMIC_SQL_FUNCTIONS = new Set([
   "database_to_xml_and_xmlschema",
   "database_to_xmlschema",
   "ts_stat",
+  "ts_rewrite",
 ]);
 
 // ── AST access ────────────────────────────────────────────────────────────────

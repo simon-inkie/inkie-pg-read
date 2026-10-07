@@ -115,6 +115,9 @@ Out:
 
 ## Follow-ups
 
+- Suggest filing as its own issue: on allowed tables, a function directly after FROM or JOIN
+  (`generate_series`, `unnest`, `jsonb_each`, `lateral`, `only`) is over-denied by the regex part of
+  the table gate. It also happens on main and fails safe.
 - `extractTableRefs` still starts from regexes and only adds what the AST sees. Making the AST the
   sole source (and dropping the regexes) would be a cleaner follow-up.
 - Column rules for views, and per-column rules for `information_schema` / `pg_catalog`, are not
@@ -162,3 +165,14 @@ Second Opus review (head f240f21): changes needed; earlier findings hold.
 9. **Nit: orphaned JSDoc for `DYNAMIC_SQL_FUNCTIONS`.** Response: moved onto the constant.
 10. **Nit: `ts_stat` only enforced in the select list.** Response: fixed by point 7.
 11. **Nit: mixed-case rule columns can never match.** Response: documented (decision 17).
+
+Third Opus review (head b216c73): all fixes verified; one last blocker.
+
+12. **Blocker: `ts_rewrite(tsquery, text)` runs its second argument as SQL and was not on the deny
+    list.** Response: added to `DYNAMIC_SQL_FUNCTIONS`; tests for the select-list and FROM forms. This
+    completes the core built-ins that execute a query string (`*_to_xml*` family, `ts_stat`,
+    `ts_rewrite`). Not chased, as agreed: extension functions (`dblink`, `crosstab`), `SECURITY DEFINER`
+    helpers, privilege-gated file and large-object functions, `current_setting`, and definition
+    readers such as `pg_get_viewdef`.
+13. **Follow-up noted:** over-denial of functions after FROM or JOIN by the regex table gate (see
+    Follow-ups).

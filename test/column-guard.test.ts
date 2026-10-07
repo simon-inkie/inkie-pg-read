@@ -408,6 +408,15 @@ describe("column guard: dynamic SQL functions as FROM items", () => {
     deniedAs("select * from ts_stat('select email from memberships')", "function", "ts_stat");
   });
 
+  it("refuses ts_rewrite, which runs its second argument as SQL", () => {
+    deniedAs(
+      "select ts_rewrite('x'::tsquery, 'select ''x''::tsquery, plainto_tsquery(''simple'', email) from memberships')",
+      "function",
+      "ts_rewrite"
+    );
+    deniedAs("select * from other o, ts_rewrite('x'::tsquery, 'select 1') t", "function", "ts_rewrite");
+  });
+
   it("still allows ordinary set-returning functions in FROM", () => {
     ok("select g from other o, generate_series(1, 3) g");
     ok("select e.key from other o, jsonb_each(o.data) e");
