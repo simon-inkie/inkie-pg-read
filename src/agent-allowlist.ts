@@ -424,8 +424,10 @@ function describeViolation(v: ColumnViolation): string {
       return `\`${v.column}\` could not be resolved against ${t}`;
     case "function":
       return `function \`${v.column}\``;
+    case "catalog":
+      return `statistics relation \`${v.column}\``;
     case "unparseable":
-      return `query mentioning ${t} could not be analysed`;
+      return "query could not be analysed";
   }
 }
 
@@ -487,10 +489,14 @@ export function buildColumnDenialMessage(
       lines.push(`pgr: access denied for function \`${first.column}\`.`);
       lines.push(`Reason: it runs SQL from a string, which pgr cannot check against the column allowlists ${where}.`);
       break;
+    case "catalog":
+      lines.push(`pgr: access denied for \`${first.column}\`.`);
+      lines.push(`Reason: statistics views expose sample values of every column, which would sidestep the column allowlists ${where}.`);
+      break;
     case "unparseable":
       lines.push(`pgr: access denied: this query could not be analysed.`);
-      lines.push(`Reason: it mentions \`${table}\`, which has a column allowlist, and pgr refuses queries it cannot parse in that case ${where}.`);
-      lines.push(`Try a simpler form of the query, with explicit columns. Allowed columns: ${list}.`);
+      lines.push(`Reason: a column allowlist is active, and pgr refuses any query it cannot parse, since it cannot tell what it reads ${where}.`);
+      lines.push(`Try a simpler form of the query, with explicit, qualified columns.`);
       break;
   }
 

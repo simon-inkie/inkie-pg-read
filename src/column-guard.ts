@@ -21,8 +21,10 @@
  * - a column alias list on a restricted table (`from t as m(a, b)` renames
  *   columns out from under the list)
  * - functions that run SQL given as a string (`query_to_xml` and friends)
- * - a query this parser cannot read (NATURAL JOIN, `(t).col`, TABLE t, ...), if it
- *   mentions a restricted table at all
+ * - pg_stats and the other statistics relations, which expose column values
+ * - any query this parser cannot read (NATURAL JOIN, `(t).col`, TABLE t, ...):
+ *   it cannot be checked, so it is refused whether or not it names a
+ *   restricted table
  *
  * Derived tables and CTEs are opaque: their own bodies are checked, so
  * anything they expose is already limited to permitted columns.
@@ -31,8 +33,6 @@
  */
 
 import { parse } from "pgsql-ast-parser";
-
-import { identifierTokens } from "./table-refs.js";
 
 /** Lower-cased table name (optionally "schema.table") -> allowed column names. */
 export type ColumnRules = ReadonlyMap<string, readonly string[]>;
@@ -45,7 +45,8 @@ export type ColumnViolationKind =
   | "alias-list" // from t as m(a, b)
   | "unresolved" // qualifier matches no source
   | "function" // dynamic-SQL function
-  | "unparseable"; // could not be parsed and mentions a restricted table
+  | "catalog" // statistics relation that exposes column values
+  | "unparseable"; // could not be parsed
 
 export interface ColumnViolation {
   kind: ColumnViolationKind;
@@ -66,6 +67,19 @@ export type ColumnCheckResult =
  * They would sidestep both gates, so they are refused whenever column rules
  * are active.
  */
+/**
+ * System relations that expose column values (most common values, histogram
+ * bounds). pg_catalog is otherwise always readable, so these are refused
+ * whenever column rules are active, in any schema position.
+ */
+const STATS_RELATIONS = new Set([
+  "pg_stats",
+  "pg_stats_ext",
+  "pg_stats_ext_exprs",
+  "pg_statistic",
+  "pg_statistic_ext_data",
+]);
+
 const DYNAMIC_SQL_FUNCTIONS = new Set([
   "query_to_xml",
   "query_to_xml_and_xmlschema",
@@ -96,6 +110,19 @@ function isNode(v: unknown): v is Node {
 
 function str(v: unknown): string | undefined {
   return typeof v === "string" ? v : undefined;
+}
+
+/**
+ * Identifiers the parser hands over are already folded the way Postgres folds
+ * them: unquoted names are lower-cased, quoted names keep their case. Names
+ * that are compared for identity (aliases, qualifiers, columns, CTEs) are
+ * therefore used as given, so `m."ROLE"` is not `m.role`. Folding them here
+ * would let a quoted name alias an unquoted one and resolve to the wrong
+ * source. Only names matched against config (tables, schemas) and the function
+ * deny list are lower-cased, which can only over-match.
+ */
+function id(v: unknown): string | undefined {
+  return str(v);
 }
 
 function lower(v: unknown): string | undefined {
@@ -246,7 +273,7 @@ class Checker {
       // A non-recursive CTE body cannot see its own name: a table of the same
       // name inside it is the real one.
       this.visit(bind["statement"], cur);
-      const alias = isNode(bind["alias"]) ? lower(bind["alias"]["name"]) : undefined;
+      const alias = isNode(bind["alias"]) ? id(bind["alias"]["name"]) : undefined;
       if (alias !== undefined) {
         cur = { parent: cur, sources: [], ctes: new Set([alias]) };
       }
@@ -255,7 +282,7 @@ class Checker {
   }
 
   private withRecursive(node: Node, parent: Scope | undefined): void {
-    const alias = isNode(node["alias"]) ? lower(node["alias"]["name"]) : undefined;
+    const alias = isNode(node["alias"]) ? id(node["alias"]["name"]) : undefined;
     const cur: Scope | undefined =
       alias === undefined
         ? parent
@@ -290,11 +317,11 @@ class Checker {
       } else {
         this.visit(expr, scope);
       }
-      const alias = isNode(col["alias"]) ? lower(col["alias"]["name"]) : undefined;
+      const alias = isNode(col["alias"]) ? id(col["alias"]["name"]) : undefined;
       if (alias !== undefined) {
         outputNames.add(alias);
       } else if (isNode(expr) && expr["type"] === "ref" && expr["table"] !== undefined) {
-        const name = lower(expr["name"]);
+        const name = id(expr["name"]);
         if (name !== undefined && name !== "*") outputNames.add(name);
       }
     }
@@ -307,7 +334,7 @@ class Checker {
         isNode(by) &&
         by["type"] === "ref" &&
         by["table"] === undefined &&
-        outputNames.has(lower(by["name"]) ?? "")
+        outputNames.has(id(by["name"]) ?? "")
       ) {
         continue;
       }
@@ -322,13 +349,20 @@ class Checker {
 
     if (type === "table" && isNode(f["name"])) {
       const n = f["name"];
-      const name = lower(n["name"]);
-      if (name === undefined) return;
+      const rawName = id(n["name"]);
+      if (rawName === undefined) return;
+      const name = rawName.toLowerCase();
       const schema = lower(n["schema"]);
-      const alias = isNode(n["alias"]) ? lower(n["alias"]["name"]) : lower(n["alias"]);
-      const exposed = alias ?? name;
+      const alias = isNode(n["alias"]) ? id(n["alias"]["name"]) : id(n["alias"]);
+      const exposed = alias ?? rawName;
 
-      if (schema === undefined && cteVisible(scope.parent, name)) {
+      if (STATS_RELATIONS.has(name)) {
+        // Planner statistics hold sample values and histogram bounds of every
+        // column, including restricted ones.
+        this.report({ kind: "catalog", column: name });
+      }
+
+      if (schema === undefined && cteVisible(scope.parent, rawName)) {
         scope.sources.push({ exposed, restriction: null });
         return;
       }
@@ -346,13 +380,13 @@ class Checker {
     }
 
     if (type === "statement") {
-      scope.sources.push({ exposed: lower(f["alias"]), restriction: null });
+      scope.sources.push({ exposed: id(f["alias"]), restriction: null });
       return;
     }
 
     if (type === "call") {
       const fn = isNode(f["function"]) ? lower(f["function"]["name"]) : undefined;
-      const alias = isNode(f["alias"]) ? lower(f["alias"]["name"]) : lower(f["alias"]);
+      const alias = isNode(f["alias"]) ? id(f["alias"]["name"]) : id(f["alias"]);
       scope.sources.push({ exposed: alias ?? fn, restriction: null });
       return;
     }
@@ -367,7 +401,7 @@ class Checker {
     // USING (c) reads c from both sides; require it of every restricted source
     // in this FROM clause.
     for (const u of nodes(join["using"])) {
-      const col = lower(u["name"]);
+      const col = id(u["name"]);
       if (col === undefined) continue;
       for (const src of restricted) {
         if (!src.restriction!.allowed.has(col)) {
@@ -381,12 +415,12 @@ class Checker {
     const table = isNode(ref["table"]) ? ref["table"] : undefined;
     if (table) {
       const src = findSource(scope, {
-        name: lower(table["name"]) ?? "",
-        schema: lower(table["schema"]),
+        name: id(table["name"]) ?? "",
+        schema: id(table["schema"]),
       });
       if (src?.restriction) this.violation("star", src.restriction);
       else if (!src && restrictedIn(scope).length > 0) {
-        this.violation("unresolved", restrictedIn(scope)[0]!.restriction, lower(table["name"]));
+        this.violation("unresolved", restrictedIn(scope)[0]!.restriction, id(table["name"]));
       }
       return;
     }
@@ -397,7 +431,7 @@ class Checker {
 
   private ref(ref: Node, scope: Scope | undefined): void {
     if (!scope) return;
-    const name = lower(ref["name"]);
+    const name = id(ref["name"]);
     if (name === undefined) return;
 
     if (name === "*") {
@@ -407,8 +441,8 @@ class Checker {
 
     const table = isNode(ref["table"]) ? ref["table"] : undefined;
     if (table) {
-      const qualifier = lower(table["name"]) ?? "";
-      const src = findSource(scope, { name: qualifier, schema: lower(table["schema"]) });
+      const qualifier = id(table["name"]) ?? "";
+      const src = findSource(scope, { name: qualifier, schema: id(table["schema"]) });
       if (!src) {
         const restricted = restrictedIn(scope);
         if (restricted.length > 0) {
@@ -464,8 +498,9 @@ class Checker {
  *
  * With no rules the result is always `{ allowed: true }`. Otherwise the query
  * is parsed and every reference to a restricted table is checked. A query the
- * parser cannot read is refused if it mentions a restricted table name
- * anywhere, and let through if it does not.
+ * parser cannot read is always refused: with no AST there is no way to tell
+ * what it reads (including through dynamic SQL), and a token scan can be
+ * bypassed.
  */
 export function checkColumnAccess(sql: string, rules: ColumnRules): ColumnCheckResult {
   if (rules.size === 0) return { allowed: true };
@@ -474,14 +509,14 @@ export function checkColumnAccess(sql: string, rules: ColumnRules): ColumnCheckR
   try {
     statements = parse(sql) as unknown[];
   } catch {
-    return unparseable(sql, rules);
+    return unparseable();
   }
 
   const checker = new Checker(rules);
   try {
     checker.visit(statements, undefined);
   } catch {
-    return unparseable(sql, rules);
+    return unparseable();
   }
 
   return checker.violations.length === 0
@@ -489,14 +524,6 @@ export function checkColumnAccess(sql: string, rules: ColumnRules): ColumnCheckR
     : { allowed: false, violations: checker.violations };
 }
 
-function unparseable(sql: string, rules: ColumnRules): ColumnCheckResult {
-  const tokens = identifierTokens(sql);
-  const violations: ColumnViolation[] = [];
-  for (const [key, cols] of rules) {
-    const bare = key.slice(key.indexOf(".") + 1);
-    if (tokens.has(bare)) {
-      violations.push({ kind: "unparseable", table: key, allowed: [...cols] });
-    }
-  }
-  return violations.length === 0 ? { allowed: true } : { allowed: false, violations };
+function unparseable(): ColumnCheckResult {
+  return { allowed: false, violations: [{ kind: "unparseable" }] };
 }

@@ -47,8 +47,9 @@ describe("column guard: permitted columns", () => {
     ok("select m.role from memberships as m where m.client_id = 5");
   });
 
-  it("is case-insensitive about names", () => {
-    ok('select M.ID, "M"."Role" from memberships "M"');
+  it("folds unquoted names the way Postgres does", () => {
+    ok("select M.ID, M.Role from memberships M");
+    ok('select "M".id, "M".role from memberships "M"');
   });
 
   it("allows schema-qualified tables and qualifiers", () => {
@@ -122,8 +123,21 @@ describe("column guard: unpermitted columns", () => {
     expect(v.map((x) => x.column)).toEqual(["email", "phone"]);
   });
 
-  it("does not let a quoted, differently cased name through", () => {
-    deniedAs('select m."Email" from memberships m', "column", "email");
+  it("treats a quoted, differently cased column as a different column", () => {
+    deniedAs('select m."Email" from memberships m', "column", "Email");
+    deniedAs('select m."ROLE" from memberships m', "column", "ROLE");
+    deniedAs('select m.id from memberships m where m."ROLE" = 1', "column", "ROLE");
+  });
+
+  it("does not let a quoted alias stand in for an unquoted one", () => {
+    // "M" is the restricted table; m is an unrelated one. Folding would resolve
+    // "M".email to clients.
+    deniedAs('select "M".email from clients m, memberships "M"', "column", "email");
+    deniedAs('select m.id from memberships m, (select 1) "M" where "M".id = m.email', "column", "email");
+  });
+
+  it("does not let a quoted CTE name hide the real table", () => {
+    deniedAs('with "Memberships" as (select 1 as email) select m.email from memberships m', "column", "email");
   });
 
   it("rejects an unlisted column through a schema-qualified qualifier", () => {
@@ -338,19 +352,60 @@ describe("column guard: whole-row expressions and functions", () => {
 });
 
 describe("column guard: queries the parser cannot read", () => {
-  it("fails closed when a restricted table is mentioned", () => {
-    const v = denied("select c.name from clients c natural join memberships");
-    expect(v.map((x) => x.kind)).toEqual(expect.arrayContaining(["unparseable"]));
+  it("refuses them when a restricted table is mentioned", () => {
+    deniedAs("select c.name from clients c natural join memberships", "unparseable");
     deniedAs("table memberships", "unparseable");
     deniedAs("select (m).email from memberships m", "unparseable");
   });
 
-  it("does not mention comments or string literals as references", () => {
-    ok("table clients -- memberships");
-    ok("select 'memberships' as t, 1 from clients where id in (select 1) and name collate \"C\" = 'x'");
+  it("refuses them even when no restricted table is mentioned", () => {
+    deniedAs("table clients", "unparseable");
+    deniedAs("select c.name from clients c natural join other", "unparseable");
   });
 
-  it("lets through an unparseable query that does not mention a restricted table", () => {
-    ok("table clients");
+  it("refuses unparseable queries that smuggle in dynamic SQL", () => {
+    deniedAs(
+      "select (o).x, query_to_xml('select email from memberships', true, false, '') from other o",
+      "unparseable"
+    );
+    deniedAs(
+      "select o.id from other o natural join xmltable('/a' passing query_to_xml('select email from memberships', true, false, '') columns x text) t",
+      "unparseable"
+    );
+  });
+
+  it("refuses the parseable form of the same dynamic SQL too", () => {
+    deniedAs(
+      "select o.id, query_to_xml('select email from memberships', true, false, '') from other o",
+      "function"
+    );
+    deniedAs(
+      "select o.id from other o, xmltable('/a' passing query_to_xml('select email from memberships', true, false, '') columns x text) t",
+      "unparseable"
+    );
+  });
+});
+
+describe("column guard: statistics relations", () => {
+  it("refuses pg_stats and friends in any position or schema form", () => {
+    for (const rel of ["pg_stats", "pg_catalog.pg_stats", "pg_stats_ext", "pg_stats_ext_exprs", "pg_statistic"]) {
+      deniedAs(`select 1 from ${rel}`, "catalog");
+    }
+    deniedAs(
+      "select s.most_common_vals from pg_catalog.pg_stats s where s.tablename = 'memberships' and s.attname = 'email'",
+      "catalog"
+    );
+    deniedAs("select 1 from clients c where exists (select 1 from pg_stats)", "catalog");
+    deniedAs("with s as (select 1 from pg_stats) select 1 from s", "catalog");
+  });
+
+  it("leaves the rest of the catalog readable", () => {
+    ok("select table_name from information_schema.tables");
+    ok("select tablename from pg_catalog.pg_tables");
+    ok("select attname from pg_catalog.pg_attribute");
+  });
+
+  it("only applies when column rules are active", () => {
+    ok("select most_common_vals from pg_stats", new Map());
   });
 });

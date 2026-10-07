@@ -92,7 +92,15 @@ Out:
     the plain string form already covers "all columns".
 12. **API shape kept.** `readAllowlistFromFile` still returns table names; column rules come from the
     new `readAllowConfigFromFile` and `scope.columnRules`. `checkAgainstAllowlist` is unchanged.
-13. **Order of gates.** Table gate first, then column gate, then audit and connect. Column denials
+13. **Statistics relations refused.** `pg_stats`, `pg_stats_ext`, `pg_stats_ext_exprs`,
+    `pg_statistic` and `pg_statistic_ext_data` are refused while column rules are active, in any
+    schema position, because they expose values of restricted columns and `pg_catalog` is otherwise
+    always readable. The rest of `pg_catalog` and `information_schema` stay readable.
+14. **Identifier case is Postgres-faithful.** The parser folds unquoted names and preserves quoted
+    ones; aliases, qualifiers, columns, CTE names and `USING` names are compared as given. Only
+    table and schema names (matched against config) and function names (deny list) are lower-cased,
+    which can only over-match. Folding everything would let `"M"` stand in for `m`.
+15. **Order of gates.** Table gate first, then column gate, then audit and connect. Column denials
     are written to the audit log with `decision: deny`.
 
 ## Follow-ups
@@ -101,6 +109,7 @@ Out:
   interviews, secret_table")` returns only `interviews`. Reproduced; not touched here. The column guard
   does see such tables (it uses the parser), so restricted tables are still covered. Worth feeding the
   parser's table list into the table gate.
+- Suggest filing the comma-FROM gap as its own issue; this PR's parser walk could feed the table gate.
 - The same extraction can miss tables in other shapes the regex does not model; the parser walk could
   replace it.
 - Column rules for views, and per-column rules for `information_schema` / `pg_catalog`, are not
@@ -110,4 +119,27 @@ Out:
 
 ## Review feedback
 
-(None yet.)
+Opus review of the first push: changes needed.
+
+1. **Blocker: unparseable-query fallback bypassed with dynamic SQL.** Confirmed: the token check ran
+   after strings were stripped and never consulted the function deny list, so
+   `select (o).x, query_to_xml('select email from memberships', ...) from other o` passed. Response:
+   fixed by refusing every unparseable query while column rules are active. Tests: unparseable plus
+   dynamic SQL (both reviewer examples), unparseable with and without a restricted table, and CLI.
+2. **Blocker: `pg_stats` leaks restricted column values.** Confirmed in principle: `pg_catalog` is
+   auto-allowed and `pg_stats*` hold most common values and histogram bounds. Response: refused
+   `pg_stats`, `pg_stats_ext`, `pg_stats_ext_exprs`, plus `pg_statistic` and `pg_statistic_ext_data`,
+   while column rules are active; documented in the README. Tests added at guard and CLI level, and a
+   test that other catalog views stay readable.
+3. **Should fix: dynamic-SQL function list is a denylist.** Agreed, cannot be closed statically.
+   Response: stated as a known limitation in the README (`dblink`, security definer helpers, future
+   built-ins).
+4. **Should fix: quoted identifiers were lower-cased.** Response: fixed rather than documented. Names
+   compared for identity are now used as the parser gives them, so `m."ROLE"` is denied. This also
+   closed two related resolution cases I found while fixing it: a quoted alias `"M"` resolving to
+   an unquoted `m`, and a quoted CTE name `"Memberships"` hiding the real table. Tests added for all
+   three.
+5. **Should fix: comma-FROM missing from the table gate.** Predates this PR. Response: kept in
+   Follow-ups with a suggestion to file it as its own issue.
+6. **Note junk-entry behaviour change.** Response: added to the README strict-validation paragraph and
+   the PR description.

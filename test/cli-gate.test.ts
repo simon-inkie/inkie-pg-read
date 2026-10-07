@@ -261,6 +261,23 @@ describe("cli gate: column permissions", () => {
     expect(result.stderr).not.toContain("Query error");
   });
 
+  it("denies pg_stats while column rules are active", () => {
+    const result = run(
+      "select most_common_vals from pg_catalog.pg_stats where attname = 'email'",
+      { cwdConfig: config }
+    );
+    expect(wasColumnDenied(result)).toBe(true);
+    expect(result.stderr).toContain("pg_stats");
+  });
+
+  it("denies an unparseable query that smuggles in dynamic SQL", () => {
+    const result = run(
+      "select (o).x, query_to_xml('select email from memberships', true, false, '') from interviews o",
+      { cwdConfig: config }
+    );
+    expect(wasColumnDenied(result)).toBe(true);
+  });
+
   it("does not gate columns in operator mode", () => {
     const result = run("select * from memberships");
     expect(wasDenied(result)).toBe(false);

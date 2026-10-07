@@ -275,8 +275,15 @@ The query is refused if it:
 - uses an unqualified column while a restricted table is in scope, since `pgr`
   has no catalog to tell which table it belongs to (write `m.role`, not `role`),
 - renames columns with an alias list (`from memberships as m(a, b)`),
-- calls a function that runs SQL from a string (`query_to_xml` and friends), or
-- is a query `pgr` cannot parse that mentions the restricted table.
+- calls a function that runs SQL from a string (`query_to_xml` and friends),
+- reads `pg_stats`, `pg_stats_ext`, `pg_stats_ext_exprs`, `pg_statistic` or
+  `pg_statistic_ext_data`, which expose sample values and histogram bounds of
+  every column (the rest of `pg_catalog` stays readable), or
+- is a query `pgr` cannot parse. While column rules are active this is refused
+  outright, whether or not it names a restricted table, because there is no way
+  to tell what it reads. If a legitimate query is refused for this reason, write
+  it in a simpler form (`NATURAL JOIN`, `(t).col`, `TABLE t` and `COLLATE` are
+  not understood by the parser).
 
 `count(*)` and `exists (select * ...)` are fine, as they read no column. A bare
 name in `order by` that matches an output column is fine too.
@@ -294,9 +301,17 @@ under `pgr` or `pgr.tables`, an object entry with extra keys, a missing or empty
 `columns`, a wildcard column, or the same table listed twice makes `pgr` exit with
 an error naming the file and the offending path. It never falls back to a guess.
 A missing file, or a file with no `pgr.tables.allow`, is still plain default-deny.
+This is stricter than before: junk entries in `allow` (a number, `null`) and
+malformed JSON used to be skipped silently and now stop `pgr` with an error.
 
-Like the rest of the SQL guard this is a local, defence-in-depth check, not the
-security boundary. For hard column limits that hold for every caller, grant the
+Identifiers follow Postgres folding: unquoted names are case-insensitive, but a
+quoted name keeps its case, so `m."ROLE"` is not the allowed column `role`.
+
+Known limitations: the list of functions that run SQL from a string is a
+denylist, so something it does not name (`dblink`, a `SECURITY DEFINER` helper in
+your database, a function added by a future Postgres version) can still read
+columns this check cannot see. Like the rest of the SQL guard this is a local,
+defence-in-depth check, not the security boundary. For hard column limits that hold for every caller, grant the
 database role only those columns. Row-level filtering is not part of this.
 
 ## SQL guard
