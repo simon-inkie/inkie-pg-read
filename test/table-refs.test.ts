@@ -239,3 +239,32 @@ describe("edge cases", () => {
     expect(result).toEqual(["public.tickets"]);
   });
 });
+
+describe("extractTableRefs: comma-separated FROM items", () => {
+  it("sees every item after a comma", () => {
+    expect(extractTableRefs("select 1 from interviews, secret_table")).toEqual(
+      new Set(["interviews", "secret_table"])
+    );
+    expect(extractTableRefs("select 1 from a x, b y, public.c z")).toEqual(
+      new Set(["a", "b", "public.c"])
+    );
+  });
+
+  it("sees them in subqueries and CTE bodies, and ignores CTE names", () => {
+    expect(
+      extractTableRefs("with r as (select 1 from a, b) select 1 from r, (select 1 from c, d) s")
+    ).toEqual(new Set(["a", "b", "c", "d"]));
+  });
+
+  it("does not let a CTE hide a real table of the same name inside its own body", () => {
+    expect(
+      extractTableRefs("with t as (select 1 from t, u) select 1 from t")
+    ).toEqual(new Set(["t", "u"]));
+  });
+
+  it("falls back to the regex result when the query does not parse", () => {
+    expect(extractTableRefs("select 1 from a natural join b")).toEqual(
+      new Set(["a", "b"])
+    );
+  });
+});

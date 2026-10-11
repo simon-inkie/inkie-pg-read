@@ -15,14 +15,25 @@ export {
   resolveAllowlistScope,
   readAgentAllowlist,
   readAllowlistFromFile,
+  readAllowConfigFromFile,
+  parseAllowConfig,
   cwdConfigPath,
   CWD_CONFIG_FILE,
   checkAllowlist,
   checkAgainstAllowlist,
   buildDenialMessage,
   buildCwdDenialMessage,
+  buildColumnDenialMessage,
   AllowlistDeniedError,
+  AllowlistConfigError,
 } from "./agent-allowlist.js";
-export type { AllowlistScope } from "./agent-allowlist.js";
+export type { AllowlistScope, AllowConfig } from "./agent-allowlist.js";
+export { checkColumnAccess } from "./column-guard.js";
+export type {
+  ColumnRules,
+  ColumnViolation,
+  ColumnViolationKind,
+  ColumnCheckResult,
+} from "./column-guard.js";
 export { writeAuditLog } from "./audit-log.js";
 export type { AuditEntry, AuditDecision } from "./audit-log.js";

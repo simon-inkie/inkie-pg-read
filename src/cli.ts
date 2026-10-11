@@ -24,10 +24,12 @@ import {
   checkAgainstAllowlist,
   buildDenialMessage,
   buildCwdDenialMessage,
+  buildColumnDenialMessage,
   CWD_CONFIG_FILE,
-  AllowlistDeniedError,
+  AllowlistConfigError,
   type AllowlistScope,
 } from "./agent-allowlist.js";
+import { checkColumnAccess } from "./column-guard.js";
 import { writeAuditLog } from "./audit-log.js";
 import { runQuery } from "./client.js";
 import { renderOutput, type OutputFormat } from "./output.js";
@@ -88,6 +90,18 @@ Per-agent table gating:
 
   Both gated modes always allow information_schema and pg_catalog.
   To grant access, add the table to that file's pgr.tables.allow list.
+
+Column permissions:
+  An allow entry may be an object that limits a table to some columns:
+    { "pgr": { "tables": { "allow": [
+        "interviews",
+        { "table": "memberships", "columns": ["id", "role", "client_id"] }
+    ] } } }
+  A plain string still allows every column. For a table with a column list,
+  queries must name permitted columns only: select *, unqualified columns,
+  whole-row references (to_jsonb(t)) and unlisted columns are refused before
+  anything runs. Qualify columns with the table or alias (m.role).
+  A config pgr cannot read as written is an error, not a default.
 
   With no AGENT_NAME, no --agent and no ${CWD_CONFIG_FILE} in the current
   directory, the gate is bypassed (operator mode).
@@ -205,7 +219,25 @@ async function main(): Promise<void> {
   // operator mode (no gate). See resolveAllowlistScope.
   const agentName = resolveAgentName(agentFlag);
   const tableRefs = extractTableRefs(query);
-  const scope = resolveAllowlistScope(agentName);
+  let scope: AllowlistScope;
+  try {
+    scope = resolveAllowlistScope(agentName);
+  } catch (err) {
+    if (err instanceof AllowlistConfigError) {
+      // A malformed config is fatal: never fall back to a guess about access.
+      process.stderr.write(err.message + "\n");
+      writeAuditLog({
+        ts: new Date().toISOString(),
+        agent: agentName ?? "cwd-project",
+        sql: query,
+        tables_referenced: Array.from(tableRefs),
+        decision: "deny",
+        reason: "invalid allowlist config",
+      });
+      process.exit(1);
+    }
+    throw err;
+  }
 
   if (scope.mode !== "operator") {
     const result = checkAgainstAllowlist(tableRefs, scope.allow);
@@ -227,6 +259,29 @@ async function main(): Promise<void> {
       });
 
       process.exit(1);
+    }
+
+    // Column gate: for tables allowed only with a column list.
+    if (scope.columnRules.size > 0) {
+      const columns = checkColumnAccess(query, scope.columnRules);
+      if (!columns.allowed) {
+        process.stderr.write(
+          buildColumnDenialMessage(columns.violations, scope.configPath) + "\n"
+        );
+
+        writeAuditLog({
+          ts: new Date().toISOString(),
+          agent: auditAgentLabel(scope),
+          sql: query,
+          tables_referenced: Array.from(tableRefs),
+          decision: "deny",
+          reason: `column access denied: ${columns.violations
+            .map((v) => `${v.kind}${v.table ? ` ${v.table}` : ""}${v.column ? ` ${v.column}` : ""}`)
+            .join(", ")}`,
+        });
+
+        process.exit(1);
+      }
     }
   }
 

@@ -2,8 +2,10 @@
  * table-refs.ts — extract referenced table names from a SQL query.
  *
  * Design:
- * - Regex-based, not a full AST. Bias toward over-rejection (false positives)
- *   rather than under-rejection (false negatives that let through denied tables).
+ * - Regex-based, plus the parser's view of FROM items when the query parses
+ *   (the regexes alone miss `from a, b`). Bias toward over-rejection (false
+ *   positives) rather than under-rejection (false negatives that let through
+ *   denied tables).
  * - Handles: FROM clauses, all JOIN types, CTEs (WITH ... AS), schema-qualified
  *   names (information_schema.tables → "information_schema.tables" as full ref,
  *   but the table name and schema are both surfaced).
@@ -11,6 +13,8 @@
  * - Schema-qualified tables are returned in "schema.table" form so the caller
  *   can whitelist them by schema prefix.
  */
+
+import { parse } from "pgsql-ast-parser";
 
 /**
  * Strip single-quoted string literals from SQL to prevent false matches
@@ -171,6 +175,12 @@ export function extractTableRefs(sql: string): Set<string> {
     refs.delete(cte);
   }
 
+  // The regexes only see a table straight after FROM or JOIN, so they miss
+  // every later item of `from a, b`. When the query parses, add what the AST
+  // says. This only ever adds references, so a parser gap cannot loosen the
+  // gate.
+  for (const ref of extractTableRefsFromAst(sql)) refs.add(ref);
+
   return refs;
 }
 
@@ -187,3 +197,70 @@ const SQL_KEYWORDS = new Set([
   "with", "recursive", "lateral", "exists", "between", "like", "ilike",
   "table", "view", "index", "schema", "database", "if",
 ]);
+
+
+/**
+ * Real tables named in FROM items anywhere in the query, read from the AST:
+ * comma-separated items, subqueries, CTE bodies, joins. Names are in the same
+ * lower-cased "table" / "schema.table" form as extractTableRefs. CTE names in
+ * scope are excluded; a CTE does not hide a table of the same name inside its
+ * own (non-recursive) body. Returns an empty set if the query does not parse.
+ */
+export function extractTableRefsFromAst(sql: string): Set<string> {
+  const refs = new Set<string>();
+  let statements: unknown[];
+  try {
+    statements = parse(sql) as unknown[];
+  } catch {
+    return refs;
+  }
+
+  type Node = Record<string, unknown>;
+  const isNode = (v: unknown): v is Node =>
+    typeof v === "object" && v !== null && !Array.isArray(v);
+
+  const walk = (node: unknown, ctes: ReadonlySet<string>): void => {
+    if (Array.isArray(node)) {
+      for (const n of node) walk(n, ctes);
+      return;
+    }
+    if (!isNode(node)) return;
+
+    if (node["type"] === "with" && Array.isArray(node["bind"])) {
+      let cur = ctes;
+      for (const bind of node["bind"]) {
+        if (!isNode(bind)) continue;
+        walk(bind["statement"], cur);
+        const alias = isNode(bind["alias"]) ? bind["alias"]["name"] : undefined;
+        if (typeof alias === "string") cur = new Set([...cur, alias]);
+      }
+      walk(node["in"], cur);
+      return;
+    }
+    if (node["type"] === "with recursive") {
+      const alias = isNode(node["alias"]) ? node["alias"]["name"] : undefined;
+      const cur = typeof alias === "string" ? new Set([...ctes, alias]) : ctes;
+      walk(node["bind"], cur);
+      walk(node["in"], cur);
+      return;
+    }
+    if (node["type"] === "table" && isNode(node["name"])) {
+      const name = node["name"]["name"];
+      const schema = node["name"]["schema"];
+      if (typeof name === "string") {
+        if (typeof schema === "string") {
+          refs.add(`${schema.toLowerCase()}.${name.toLowerCase()}`);
+        } else if (!ctes.has(name)) {
+          refs.add(name.toLowerCase());
+        }
+      }
+      return;
+    }
+    for (const [key, value] of Object.entries(node)) {
+      if (key !== "type") walk(value, ctes);
+    }
+  };
+
+  walk(statements, new Set());
+  return refs;
+}
